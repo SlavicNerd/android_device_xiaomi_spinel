@@ -9,13 +9,26 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Free Disk Space
+    - name: Maximize Build Space
+      uses: easimon/maximize-build-space@v10
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 0
+        remove-dotnet: true
+        remove-android: true
+        remove-haskell: true
+        remove-codeql: true
+        remove-docker-images: true
+
+    - name: Free Additional Disk Space
       run: |
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /usr/local/lib/android
         sudo rm -rf /opt/ghc
         sudo rm -rf /usr/local/share/boost
         sudo apt-get clean
+        echo "Disk usage after cleanup:"
+        df -h
 
     - name: Set up Swap Space
       run: |
@@ -51,13 +64,28 @@ jobs:
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         git config --global url."https://gitlab.com/".insteadOf "git@gitlab.com:"
-        
+
         mkdir -p ~/OrangeFox_sync
         cd ~/OrangeFox_sync
         git clone https://gitlab.com/OrangeFox/sync.git
-        
+
         cd sync
         ./orangefox_sync.sh --branch 12.1 --path ~/fox_12.1
+
+    - name: Verify OrangeFox Source Sync
+      run: |
+        echo "Disk usage after sync:"
+        df -h
+
+        if [ ! -f ~/fox_12.1/vendor/fox/config/common.mk ]; then
+          echo "::error::vendor/fox is missing - the OrangeFox sync did not complete."
+          echo "This is almost always disk space or a network failure during repo sync."
+          echo "Contents of ~/fox_12.1:"
+          ls -la ~/fox_12.1 || true
+          exit 1
+        fi
+
+        echo "vendor/fox is present - sync looks complete."
 
     - name: Copy Device Tree & Build Recovery
       shell: /usr/bin/bash {0}
@@ -65,9 +93,16 @@ jobs:
         # Ensure target folder exists and copy tree
         mkdir -p ~/fox_12.1/device/xiaomi/spinel
         cp -r $GITHUB_WORKSPACE/* ~/fox_12.1/device/xiaomi/spinel/
-        
+
+        # Fail fast if the device tree didn't land where expected
+        if [ ! -f ~/fox_12.1/device/xiaomi/spinel/device.mk ]; then
+          echo "::error::device.mk not found after copying device tree into ~/fox_12.1/device/xiaomi/spinel"
+          ls -la ~/fox_12.1/device/xiaomi/spinel || true
+          exit 1
+        fi
+
         cd ~/fox_12.1
-        
+
         # Explicit Environment Exports
         export ALLOW_MISSING_DEPENDENCIES=true
         export FOX_BUILD_TYPE="Unofficial"
@@ -75,19 +110,19 @@ jobs:
         export TW_THEME="portrait_hdpi"
         export TARGET_SCREEN_WIDTH=1080
         export TARGET_SCREEN_HEIGHT=2400
-        
+
         # Disable set -e temporarily for env setup
         set +e
         source build/envsetup.sh
         lunch fox_spinel-eng
         LUNCH_EXIT_CODE=$?
         set -e
-        
+
         if [ $LUNCH_EXIT_CODE -ne 0 ]; then
           echo "Error: lunch target fox_spinel-eng failed with exit status $LUNCH_EXIT_CODE"
           exit 1
         fi
-        
+
         # Compile recovery with job limiting
         mka recoveryimage -j2
 
@@ -99,4 +134,3 @@ jobs:
           /home/runner/fox_12.1/out/target/product/spinel/OrangeFox*.img
           /home/runner/fox_12.1/out/target/product/spinel/OrangeFox*.zip
           /home/runner/fox_12.1/out/target/product/spinel/recovery.img
-          
