@@ -3,59 +3,69 @@ name: Build OrangeFox Recovery - Redmi Note 15 4G (spinel)
 on:
   workflow_dispatch:
 
+env:
+  FOX_ROOT: /mnt/fox_12.1
+
 jobs:
   build:
     name: Build Recovery
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Maximize Build Space
-      uses: easimon/maximize-build-space@v10
-      with:
-        root-reserve-mb: 2048
-        swap-size-mb: 0
-        remove-dotnet: true
-        remove-android: true
-        remove-haskell: true
-        remove-codeql: true
-        remove-docker-images: true
-
-    - name: Free Additional Disk Space
+    - name: Free Disk Space
       run: |
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /usr/local/lib/android
         sudo rm -rf /opt/ghc
         sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
         sudo apt-get clean
-        echo "Disk usage after cleanup:"
+        echo "=== Disk usage after cleanup ==="
         df -h
+
+    - name: Prepare Build Volume on /mnt
+      run: |
+        # /mnt is the runner's large temp disk (~70GB free) - the root
+        # partition is far too small for a full OrangeFox source tree.
+        sudo mkdir -p "$FOX_ROOT"
+        sudo chown -R "$USER:$USER" /mnt/fox_12.1
+        echo "=== Space available on /mnt ==="
+        df -h /mnt
 
     - name: Set up Swap Space
       run: |
         sudo swapoff -a || true
-        sudo rm -f /swapfile
-        sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
+        sudo rm -f /swapfile /mnt/swapfile
+        sudo fallocate -l 8G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        free -h
 
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           gperf build-essential libssl-dev libxml2-utils xsltproc fontconfig \
-          pngcrush imagemagick zip curl zlib1g-dev gcc-multilib g++-multilib \
-          libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev libx11-dev \
-          lib32z1-dev libgl1-mesa-dev libxml2-dev readline-common libncurses5 \
-          git flex bison python3 python-is-python3 repo ccache
+          pngcrush imagemagick zip unzip curl zlib1g-dev gcc-multilib g++-multilib \
+          libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
+          libgl1-mesa-dev libxml2-dev readline-common rsync \
+          git flex bison python3 python-is-python3 ccache
+        # ncurses package names differ across releases - try both, don't fail the job
+        sudo apt-get install -y lib32ncurses-dev libncurses5 || \
+          sudo apt-get install -y lib32ncurses5-dev libncurses5 || true
 
     - name: Checkout Device Tree
       uses: actions/checkout@v4
+      with:
+        path: device_tree
 
     - name: Setup Repo Tool
       run: |
         mkdir -p ~/bin
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         echo "$HOME/bin" >> $GITHUB_PATH
 
@@ -64,54 +74,66 @@ jobs:
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         git config --global url."https://gitlab.com/".insteadOf "git@gitlab.com:"
+        git config --global color.ui false
 
-        mkdir -p ~/OrangeFox_sync
-        cd ~/OrangeFox_sync
+        mkdir -p /mnt/OrangeFox_sync
+        cd /mnt/OrangeFox_sync
         git clone https://gitlab.com/OrangeFox/sync.git
 
         cd sync
-        ./orangefox_sync.sh --branch 12.1 --path ~/fox_12.1
+        ./orangefox_sync.sh --branch 12.1 --path "$FOX_ROOT"
 
     - name: Verify OrangeFox Source Sync
       run: |
-        echo "Disk usage after sync:"
+        echo "=== Disk usage after sync ==="
         df -h
 
-        if [ ! -f ~/fox_12.1/vendor/fox/config/common.mk ]; then
+        if [ ! -f "$FOX_ROOT/vendor/fox/config/common.mk" ]; then
           echo "::error::vendor/fox is missing - the OrangeFox sync did not complete."
-          echo "This is almost always disk space or a network failure during repo sync."
-          echo "Contents of ~/fox_12.1:"
-          ls -la ~/fox_12.1 || true
+          echo "Usually caused by running out of disk space or a network failure during repo sync."
+          echo "--- Contents of $FOX_ROOT ---"
+          ls -la "$FOX_ROOT" || true
+          echo "--- Contents of $FOX_ROOT/vendor ---"
+          ls -la "$FOX_ROOT/vendor" || true
           exit 1
         fi
 
-        echo "vendor/fox is present - sync looks complete."
+        if [ ! -f "$FOX_ROOT/build/envsetup.sh" ]; then
+          echo "::error::build/envsetup.sh is missing - the source tree is incomplete."
+          exit 1
+        fi
 
-    - name: Copy Device Tree & Build Recovery
+        echo "Sync looks complete."
+
+    - name: Copy Device Tree
+      run: |
+        mkdir -p "$FOX_ROOT/device/xiaomi/spinel"
+        rsync -a --exclude='.git' "$GITHUB_WORKSPACE/device_tree/" "$FOX_ROOT/device/xiaomi/spinel/"
+
+        if [ ! -f "$FOX_ROOT/device/xiaomi/spinel/device.mk" ]; then
+          echo "::error::device.mk not found after copying the device tree."
+          echo "Check that your repository root contains device.mk (not nested in a subfolder)."
+          ls -la "$FOX_ROOT/device/xiaomi/spinel" || true
+          exit 1
+        fi
+
+        echo "--- Device tree contents ---"
+        ls -la "$FOX_ROOT/device/xiaomi/spinel"
+
+    - name: Build Recovery
       shell: /usr/bin/bash {0}
       run: |
-        # Ensure target folder exists and copy tree
-        mkdir -p ~/fox_12.1/device/xiaomi/spinel
-        cp -r $GITHUB_WORKSPACE/* ~/fox_12.1/device/xiaomi/spinel/
+        cd "$FOX_ROOT"
 
-        # Fail fast if the device tree didn't land where expected
-        if [ ! -f ~/fox_12.1/device/xiaomi/spinel/device.mk ]; then
-          echo "::error::device.mk not found after copying device tree into ~/fox_12.1/device/xiaomi/spinel"
-          ls -la ~/fox_12.1/device/xiaomi/spinel || true
-          exit 1
-        fi
-
-        cd ~/fox_12.1
-
-        # Explicit Environment Exports
         export ALLOW_MISSING_DEPENDENCIES=true
         export FOX_BUILD_TYPE="Unofficial"
         export LC_ALL="C"
         export TW_THEME="portrait_hdpi"
         export TARGET_SCREEN_WIDTH=1080
         export TARGET_SCREEN_HEIGHT=2400
+        export CCACHE_DIR=/mnt/ccache
+        export USE_CCACHE=1
 
-        # Disable set -e temporarily for env setup
         set +e
         source build/envsetup.sh
         lunch fox_spinel-eng
@@ -119,18 +141,19 @@ jobs:
         set -e
 
         if [ $LUNCH_EXIT_CODE -ne 0 ]; then
-          echo "Error: lunch target fox_spinel-eng failed with exit status $LUNCH_EXIT_CODE"
+          echo "::error::lunch fox_spinel-eng failed with exit status $LUNCH_EXIT_CODE"
           exit 1
         fi
 
-        # Compile recovery with job limiting
         mka recoveryimage -j2
 
     - name: Upload Recovery Artifacts
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: OrangeFox-spinel-Build
+        if-no-files-found: warn
         path: |
-          /home/runner/fox_12.1/out/target/product/spinel/OrangeFox*.img
-          /home/runner/fox_12.1/out/target/product/spinel/OrangeFox*.zip
-          /home/runner/fox_12.1/out/target/product/spinel/recovery.img
+          /mnt/fox_12.1/out/target/product/spinel/OrangeFox*.img
+          /mnt/fox_12.1/out/target/product/spinel/OrangeFox*.zip
+          /mnt/fox_12.1/out/target/product/spinel/recovery.img
