@@ -76,7 +76,8 @@ jobs:
         git config --global url."https://gitlab.com/".insteadOf "git@gitlab.com:"
         git config --global color.ui false
 
-        mkdir -p /mnt/OrangeFox_sync
+        sudo mkdir -p /mnt/OrangeFox_sync
+        sudo chown -R "$USER:$USER" /mnt/OrangeFox_sync
         cd /mnt/OrangeFox_sync
         git clone https://gitlab.com/OrangeFox/sync.git
 
