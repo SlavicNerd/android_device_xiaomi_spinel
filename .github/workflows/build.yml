@@ -79,7 +79,7 @@ jobs:
         sudo mkdir -p /mnt/OrangeFox_sync
         sudo chown -R "$USER:$USER" /mnt/OrangeFox_sync
         cd /mnt/OrangeFox_sync
-        git clone https://gitlab.com/OrangeFox/sync.git
+        git clone https://gitlab.com/OrangeFox/Sync/orangefox_sync.sh
 
         cd sync
         ./orangefox_sync.sh --branch 12.1 --path "$FOX_ROOT"
