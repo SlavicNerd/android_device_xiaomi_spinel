@@ -3,9 +3,6 @@ name: Build OrangeFox Recovery - Redmi Note 15 4G (spinel)
 on:
   workflow_dispatch:
 
-env:
-  FOX_ROOT: /mnt/fox_12.1
-
 jobs:
   build:
     name: Build Recovery
@@ -25,23 +22,40 @@ jobs:
         echo "=== Disk usage after cleanup ==="
         df -h
 
-    - name: Prepare Build Volume on /mnt
+    - name: Prepare Build Volume
       run: |
-        # /mnt is the runner's large temp disk (~70GB free) - the root
-        # partition is far too small for a full OrangeFox source tree.
-        sudo mkdir -p "$FOX_ROOT"
-        sudo chown -R "$USER:$USER" /mnt/fox_12.1
-        echo "=== Space available on /mnt ==="
-        df -h /mnt
+        # Don't assume /mnt is the big disk - pick whichever has more free space.
+        ROOT_FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+        MNT_FREE=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9')
+        echo "Free space: / = ${ROOT_FREE}G, /mnt = ${MNT_FREE}G"
+
+        if [ "$MNT_FREE" -gt "$ROOT_FREE" ]; then
+          BASE=/mnt/fox
+        else
+          BASE=/home/runner/fox
+        fi
+
+        sudo mkdir -p "$BASE/fox_12.1" "$BASE/sync" "$BASE/ccache"
+        sudo chown -R "$USER:$USER" "$BASE"
+
+        {
+          echo "BUILD_BASE=$BASE"
+          echo "FOX_ROOT=$BASE/fox_12.1"
+          echo "SYNC_DIR=$BASE/sync"
+          echo "CCACHE_DIR=$BASE/ccache"
+        } >> "$GITHUB_ENV"
+
+        echo "Using $BASE"
+        df -h "$BASE"
 
     - name: Set up Swap Space
       run: |
         sudo swapoff -a || true
-        sudo rm -f /swapfile /mnt/swapfile
-        sudo fallocate -l 8G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
-        sudo chmod 600 /mnt/swapfile
-        sudo mkswap /mnt/swapfile
-        sudo swapon /mnt/swapfile
+        sudo rm -f /swapfile "$BUILD_BASE/swapfile"
+        sudo fallocate -l 8G "$BUILD_BASE/swapfile" || sudo dd if=/dev/zero of="$BUILD_BASE/swapfile" bs=1M count=8192
+        sudo chmod 600 "$BUILD_BASE/swapfile"
+        sudo mkswap "$BUILD_BASE/swapfile"
+        sudo swapon "$BUILD_BASE/swapfile"
         free -h
 
     - name: Install Build Dependencies
@@ -52,7 +66,7 @@ jobs:
           pngcrush imagemagick zip unzip curl zlib1g-dev gcc-multilib g++-multilib \
           libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
           libgl1-mesa-dev libxml2-dev readline-common rsync \
-          git flex bison python3 python-is-python3 ccache
+          git flex bison python3 python-is-python3 ccache bc lz4 libelf-dev
         # ncurses package names differ across releases - try both, don't fail the job
         sudo apt-get install -y lib32ncurses-dev libncurses5 || \
           sudo apt-get install -y lib32ncurses5-dev libncurses5 || true
@@ -76,11 +90,9 @@ jobs:
         git config --global url."https://gitlab.com/".insteadOf "git@gitlab.com:"
         git config --global color.ui false
 
-        sudo mkdir -p /mnt/OrangeFox_sync
-        sudo chown -R "$USER:$USER" /mnt/OrangeFox_sync
-        cd /mnt/OrangeFox_sync
-        git clone https://gitlab.com/OrangeFox/Sync/orangefox_sync.sh
-
+        cd "$SYNC_DIR"
+        # Correct repo is OrangeFox/sync (not "Sync/orangefox_sync.sh")
+        git clone https://gitlab.com/OrangeFox/sync.git
         cd sync
         ./orangefox_sync.sh --branch 12.1 --path "$FOX_ROOT"
 
@@ -89,8 +101,9 @@ jobs:
         echo "=== Disk usage after sync ==="
         df -h
 
-        if [ ! -f "$FOX_ROOT/vendor/fox/config/common.mk" ]; then
-          echo "::error::vendor/fox is missing - the OrangeFox sync did not complete."
+        # OrangeFox keeps its vendor files in vendor/recovery (there is no vendor/fox)
+        if [ ! -d "$FOX_ROOT/vendor/recovery" ] || [ -z "$(ls -A "$FOX_ROOT/vendor/recovery")" ]; then
+          echo "::error::vendor/recovery is missing or empty - the OrangeFox sync did not complete."
           echo "Usually caused by running out of disk space or a network failure during repo sync."
           echo "--- Contents of $FOX_ROOT ---"
           ls -la "$FOX_ROOT" || true
@@ -125,28 +138,51 @@ jobs:
       shell: /usr/bin/bash {0}
       run: |
         cd "$FOX_ROOT"
+        DEV=device/xiaomi/spinel
 
         export ALLOW_MISSING_DEPENDENCIES=true
         export FOX_BUILD_TYPE="Unofficial"
         export LC_ALL="C"
-        export TW_THEME="portrait_hdpi"
-        export TARGET_SCREEN_WIDTH=1080
-        export TARGET_SCREEN_HEIGHT=2400
-        export CCACHE_DIR=/mnt/ccache
         export USE_CCACHE=1
+        export CCACHE_EXEC=/usr/bin/ccache
+
+        # --- Work out the lunch prefix from the device tree (twrp_ on 12.1, fox_ on some trees) ---
+        PREFIX=""
+        for p in twrp fox omni; do
+          if [ -f "$DEV/${p}_spinel.mk" ]; then PREFIX="$p"; break; fi
+        done
+        if [ -z "$PREFIX" ]; then
+          echo "::error::No <prefix>_spinel.mk found in $DEV - cannot pick a lunch combo."
+          ls -la "$DEV"
+          exit 1
+        fi
+        echo "Lunch combo: ${PREFIX}_spinel-eng"
+
+        # --- Work out the correct make target from BoardConfig ---
+        if grep -qsE "BOARD_USES_RECOVERY_AS_BOOT *:?= *true" "$DEV"/BoardConfig*.mk; then
+          TARGET="bootimage"
+        elif grep -qsE "BOARD_MOVE_RECOVERY_TO_VENDOR_BOOT *:?= *true" "$DEV"/BoardConfig*.mk; then
+          TARGET="vendorbootimage"
+        else
+          TARGET="recoveryimage"
+        fi
+        echo "Make target: $TARGET"
 
         set +e
         source build/envsetup.sh
-        lunch fox_spinel-eng
+        lunch "${PREFIX}_spinel-eng"
         LUNCH_EXIT_CODE=$?
         set -e
 
         if [ $LUNCH_EXIT_CODE -ne 0 ]; then
-          echo "::error::lunch fox_spinel-eng failed with exit status $LUNCH_EXIT_CODE"
+          echo "::error::lunch ${PREFIX}_spinel-eng failed with exit status $LUNCH_EXIT_CODE"
           exit 1
         fi
 
-        mka recoveryimage -j2
+        if [ "$TARGET" != "recoveryimage" ]; then
+          mka adbd
+        fi
+        mka "$TARGET" -j"$(nproc)"
 
     - name: Upload Recovery Artifacts
       if: always()
@@ -155,6 +191,8 @@ jobs:
         name: OrangeFox-spinel-Build
         if-no-files-found: warn
         path: |
-          /mnt/fox_12.1/out/target/product/spinel/OrangeFox*.img
-          /mnt/fox_12.1/out/target/product/spinel/OrangeFox*.zip
-          /mnt/fox_12.1/out/target/product/spinel/recovery.img
+          ${{ env.FOX_ROOT }}/out/target/product/spinel/OrangeFox*.img
+          ${{ env.FOX_ROOT }}/out/target/product/spinel/OrangeFox*.zip
+          ${{ env.FOX_ROOT }}/out/target/product/spinel/recovery.img
+          ${{ env.FOX_ROOT }}/out/target/product/spinel/boot.img
+          ${{ env.FOX_ROOT }}/out/target/product/spinel/vendor_boot.img
